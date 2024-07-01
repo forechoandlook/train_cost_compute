@@ -1,4 +1,7 @@
 
+** 注意：需要修改仓库中json文件路径才能跑通 ** 
+
+
 ```md
 graph.json 是反向图 
 sd_forward.json 是前向图 
