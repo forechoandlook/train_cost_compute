@@ -20,9 +20,6 @@ def cat_fix(node):
     node["input_dtype"] = node["output_dtype"] * 2
     return node
 
-
-
-
 node_fn      = {}
 ops_info     = {}
 dma_ops_info = {}
@@ -64,12 +61,11 @@ def element_wise_op_calc(node):
     return node
 
 def linear_dma_op_calc(node):
-    # bmm input_shape * output_shape[-1]
+    # 8 10 20  8 20 30  => 8 10 30
     input_shape_0 = node['input_shape'][0]
-    output_shape  = node['output_shape'][0]
-    return np.prod(input_shape_0) * output_shape[-1]
+    input_shape_1 = node['input_shape'][1]
+    return np.prod(input_shape_0) * input_shape_1[2]
 
-# layer norm, group norm 
 def norm_dma_op_calc(node):
     # layer norm + group norm
     # bias
@@ -89,15 +85,12 @@ def norm_dma_op_calc(node):
     node["ops"]     = ops
     return node
 
-# 其他的特定op特殊去算了 : conv,baddbmm 
-
 def basic_dma_op(node):
-
     if dma_ops_info[node["name"]]["norm_op"]:
         return norm_dma_op_calc(node)
-    input_len  = len(node['input_shape'])
-    output_len = len(node['output_shape'])
-    input_dtype = [dtype_map[i] for i in node['input_dtype']]
+    input_len    = len(node['input_shape'])
+    output_len   = len(node['output_shape'])
+    input_dtype  = [dtype_map[i] for i in node['input_dtype']]
     output_dtype = [dtype_map[i] for i in node['output_dtype']]
     s2l_dma = sum([ input_dtype[i]*np.prod(node['input_shape'][i]) for i in range(input_len) ])
     l2s_dma = sum([ output_dtype[i]*np.prod(node['output_shape'][i]) for i in range(output_len) ])
@@ -154,7 +147,7 @@ def add_dma_op(node):
 @warp_dma_op_shape_node(layout=[[layout.nmodel_hw_hw, 
                                  layout.nmodel_hw_seq]], linear_op=True)
 def bmm_dma_op(node):
-
+    # import pdb;pdb.set_trace()
     return basic_dma_op(node)
 
 @warp_dma_op_shape_node(layout=[[layout.nmodel_hw_hw, 
@@ -170,11 +163,32 @@ def baddbmm_dma_op(node):
     node["s2l_dma"] = s2l_dma
     node["l2s_dma"] = l2s_dma
     # alpha * batch1 @ batch2 + input * belta
-    ops = np.prod(node["input_shape"][1]) * node["input_shape"][2][-1] + np.prod(node["input_shape"][0]) * 2
+    ops = np.prod(node["input_shape"][1]) * node["input_shape"][2][-1] + np.prod(node["input_shape"][0]) * 1
     node["ops"] = ops
     return node
 
-# 最好的shape 推导方案是全局shape inference，现在作为代替方案
+@warp_dma_op_shape_node(special_op=True)
+def scaled_dot_attention_dma_op(node):
+    # input 3 output 1
+    input_len    = len(node['input_shape'])
+    output_len   = len(node['output_shape'])
+    input_dtype  = [dtype_map[i] for i in node['input_dtype']]
+    output_dtype = [dtype_map[i] for i in node['output_dtype']]
+    s2l_dma      = sum([ input_dtype[i]*np.prod(node['input_shape'][i]) for i in range(input_len) ])
+    l2s_dma      = sum([ output_dtype[i]*np.prod(node['output_shape'][i]) for i in range(output_len) ])
+    node["s2l_dma"] = s2l_dma
+    node["l2s_dma"] = l2s_dma
+    # ops 
+    shape0 = node['input_shape'][0]
+    shape1 = node['input_shape'][1]
+    shape2 = node['input_shape'][2]
+    temp   = [shape0[0] , shape0[1] , shape1[2]]
+    ops = 0
+    ops += np.prod(shape0) * shape1[2] # q * k
+    ops += np.prod(temp) * 7 # / sqrt(d_k) + softmax + mask
+    ops += np.prod(temp) * shape2[1] # v * softmax
+    node["ops"] = ops
+    return node
 
 @warp_dma_op_shape_node(layout=[[layout.n_model_h_w, 
                                  layout.n_model]], only_dma=True)
@@ -207,7 +221,7 @@ def conv2d_dma_op(node):
     node["reorder_weight_dma"] = np.prod(kernel_reorder) * dtype_len
     node["s2l_dma"] = s2l_dma
     node["l2s_dma"] = l2s_dma
-    node["ops"]     = np.prod(output_shape[0]) * kernel_size[0] * kernel_size[1]
+    node["ops"]     = np.prod(output_shape[0]) * kernel_size[0] * kernel_size[1] * ic
     return node
 
 @warp_dma_op_shape_node(layout=[[layout.n_model]],element_wise_op=True, op_rate=5)
@@ -324,13 +338,18 @@ def sin_dma_op(node):
 def softmax_dma_op(node):
     return basic_dma_op(node)
 
-@warp_dma_op_shape_node(layout=[layout.n_seq_model, 
-                                layout.n_hw_model, 
-                                layout.nmodel_hw_hw,
-                                layout.nmodel_hw_seq
-                                ],only_dma=True)
+@warp_dma_op_shape_node(special_op=True)
 def to_dma_op(node):
-    return basic_dma_op(node)
+    input_dtype  = node["input_dtype"][0]
+    output_dtype = node["output_dtype"][0]
+    if input_dtype == output_dtype:
+        node["s2l_dma"] = 0
+        node["l2s_dma"] = 0
+    else:
+        node["s2l_dma"] = np.prod(node['input_shape'][0]) * dtype_map[input_dtype]
+        node["l2s_dma"] = np.prod(node['output_shape'][0]) * dtype_map[output_dtype]
+    node["ops"] = 0
+    return node
 
 @warp_dma_op_shape_node(only_dma=True)
 def transpose_dma_op(node):
@@ -408,6 +427,10 @@ def conv2d_node( node ):
     output_shape = node[node_key]['output_shape']
     weight_shape = [output_shape[0][1], input_shape[0][1], kernel_size[0], kernel_size[1]]
     return [ handle_input_shape(input_shape[0]), weight_shape ]
+
+@warp_node()
+def scaled_dot_attention_node(node):
+    return basic_node(node)
 
 @warp_node()
 def cos_node(node):
@@ -621,10 +644,12 @@ def help_mul_ops_dma(shape1, shape2, left_trans=False, right_trans=False):
     # 1,4096,320 1280,320 right_trans=True
     # print(shape1, shape2, left_trans, right_trans)
     ops = 0
-    if left_trans:
-        ops += shape1[-1] * shape1[-2] * shape1[-3] * shape2[-1]
-    elif right_trans:
-        ops += shape1[-1] * shape1[-2] * shape1[-3] * shape2[-2]
+    if right_trans:
+        # kn mk
+        ops += np.prod(shape1) * shape2[-2]
+    else:
+        # km
+        ops += np.prod(shape1) * shape2[-1]
     return ops
 
 def sum_grad(grad_shape, cur_shape):
@@ -646,11 +671,47 @@ def back_add_node(node):
     left         = input_shape[0]
     right        = input_shape[1]
     back_ops     = 0
-    back_dma     = 0
     back_ops     += sum_grad(output_shape, left)  * (0 in back_grad_idx)
     back_ops     += sum_grad(output_shape, right) * (1 in back_grad_idx)
     # output shape is same as input shape ?
     node["back_ops"] = back_ops
+    return node
+
+@back_warp_node(output_num=3)
+def back_scaled_dot_attention_node(node):
+    # c = scaled_dot_attention(q, k, v) = softmax(q @ k.T / sqrt(d_k)) @ v
+    # c = temp @ v.T
+    # grad_v = temp.T @ grad_c
+    # temp = q @ k.T
+    # q: [b, m ,n]
+    # k: [b, t, n]
+    # temp: [b, m, t]
+    # grad_k = q.T @ grad_temp
+    # grad_q = grad_temp @ k  [b, m t] @ [b, t, n] = [b, m, n]
+    # 
+    output_shape  = node['output_shape'][0]
+    input_shape   = node['input_shape']
+    back_grad_idx = node['back_grad_idx']
+    q             = input_shape[0]
+    k             = input_shape[1]
+    v             = input_shape[2]
+    ops     = 0
+    # print("memory efficient backward pass with flash attention backward")
+    # compute qk first 
+    temp = [q[0], q[1], k[2]]
+    ops = 0
+    ops += np.prod(q) * k[2]
+    # then compute softmax
+    ops += np.prod(temp) * 7
+    # then compute grad v
+    ops += help_mul_ops_dma(temp, output_shape, True, False) * (2 in back_grad_idx)
+    # then compute grad softmax
+    ops += np.prod(temp) * 7 * ((0 in back_grad_idx) | (1 in back_grad_idx))
+    # then compute grad q
+    ops += help_mul_ops_dma(temp, k, False, True) * (0 in back_grad_idx)
+    # then compute grad k
+    ops += help_mul_ops_dma(q, temp, True, False) * (1 in back_grad_idx)
+    node["back_ops"] = ops
     return node
 
 @back_warp_node(special_fn=True, output_num=2)
@@ -660,15 +721,14 @@ def back_bmm_node(node):
     # grad_A = grad_C @ B.T
     # grad_B = A.T @ grad_C
     # cal dma + ops
-    # 输出的顺序怎么搞? => A B
     output_shape = node['output_shape'][0]
     input_shape  = node['input_shape']
     back_grad_idx = node['back_grad_idx']
     left         = input_shape[0]
     right        = input_shape[1]
     back_ops     = 0
-    back_ops     += help_mul_ops_dma(output_shape, right, True) * (0 in back_grad_idx) * (0 in back_grad_idx)
-    back_ops     += help_mul_ops_dma(left, output_shape, False, True) * (1 in back_grad_idx) * (1 in back_grad_idx)
+    back_ops     += help_mul_ops_dma(output_shape, right, False, True) * (0 in back_grad_idx) * (0 in back_grad_idx)
+    back_ops     += help_mul_ops_dma(left, output_shape, True, False) * (1 in back_grad_idx) * (1 in back_grad_idx)
     node["back_ops"] = back_ops
     return node
 
@@ -687,7 +747,7 @@ def back_baddbmm_node(node):
     back_ops        = 0
     back_ops        += np.prod(C) * (0 in back_grad_idx)
     back_ops        += help_mul_ops_dma(output_shape, B, False, True) * (1 in back_grad_idx)
-    back_ops        += help_mul_ops_dma(A, output_shape, False, True) * (2 in back_grad_idx)
+    back_ops        += help_mul_ops_dma(A, output_shape, True, False) * (2 in back_grad_idx)
     node["back_ops"] = back_ops
     return node
 
@@ -866,11 +926,10 @@ def back_gelu_node(node):
 def back_interpolate_node(node):
     # c = F.interpolate(a, size=320, mode='bilinear')
     # grad_a = F.interpolate(grad_c, size=a.shape, mode='bilinear')
-    
     input_shape  = node['input_shape']
     output_shape = node['output_shape']
     ops = 0
-    ops += np.prod(input_shape) * 4
+    ops += np.prod(output_shape) * 8
     node["back_ops"] = ops
     return node
 
@@ -931,7 +990,6 @@ def back_mul_node(node):
 def back_permute_node(node):
     # c = a.permute(1, 0, 2)
     # grad_a = grad_c.permute(1, 0, 2)
-    
     node["back_ops"] = 0
     return node
 
@@ -983,16 +1041,15 @@ def back_softmax_node(node):
 @back_warp_node(output_num=1, only_dma=True)
 def back_to_node(node):
     # c = a.to(dtype)
-    
-    input_shape  = node['input_shape']
-    output_shape = node['output_shape']
+    input_dtype  = node['input_dtype'][0]
+    output_dtype = node['output_dtype'][0]
     back_ops = 0
     node["back_ops"] = back_ops
+    node["back_dma"] = 0 if input_dtype == output_dtype else node["back_dma"]
     return node
 
 @back_warp_node(output_num=1, only_dma=True)
 def back_transpose_node(node):
-    
     input_shape  = node['input_shape']
     output_shape = node['output_shape']
     back_ops = 0

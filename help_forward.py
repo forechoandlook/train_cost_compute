@@ -1,16 +1,18 @@
 
 # how to generate forward graph and make it into table format
 import json 
+import re
 from collections import defaultdict
 import math
 import numpy as np
 from ops import *
+from module import *
 import pandas as pd
 from itertools import product
 from copy import deepcopy
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
-
+import sys 
 class mylog:
     @staticmethod
     def info(*args, **kwargs):
@@ -19,16 +21,360 @@ class mylog:
 path = "/Users/wangyangzuo/Desktop/公司/sd_forward.json"
 
 total_graph = json.load(open(path,'r'))
-
 graph         = total_graph['graph']
 links         = total_graph['links']
+global_idx    = 10000000
 reverse_links = defaultdict(list)
 in_degree     = defaultdict(int)
+id_info       = dict()
+id_name       = dict()
+is_fuse       = int(sys.argv[1])
+output_file_name = sys.argv[2]
 
-for k,v in links.items():
-    for link in v:
-        reverse_links[link].append(k)
-        in_degree[k] += 1
+
+def walk_for_moudle():
+    next_nodes = [[graph, None]]
+    param = 0
+    while next_nodes:
+        cur_node, father_node = next_nodes.pop()
+        k = list(cur_node.keys())[0]
+        if not cur_node[k]["children"]:
+            continue
+        if len(cur_node[k]["children"]) == 1:
+            param += calc_module_paraments(cur_node[k])
+        for child in cur_node[k]['children'][::-1]:
+            next_nodes.append([child, cur_node])
+    return param
+
+param = walk_for_moudle()
+
+def build_reverse_links(links):
+    global reverse_links, in_degree
+    reverse_links = defaultdict(list)
+    in_degree     = defaultdict(int)
+    for k,v in links.items():
+        for link in v:
+            reverse_links[link].append(k)
+            in_degree[k] += 1
+
+build_reverse_links(links)
+
+def build_id_info():
+    global id_info, id_name
+    next_nodes  = [[graph, None]]
+    id_info = dict()
+    while next_nodes:
+        node, parent = next_nodes.pop()
+        key_id       = list(node.keys())[0]
+        if "children" not in node[key_id] or not node[key_id]['children']:
+            id_info[key_id] = node[key_id]
+            continue
+        for child in node[key_id]['children']:
+            next_nodes.append([child, node])
+    id_name = {i:id_info[i]["name"] for i in id_info.keys()}
+
+build_id_info()
+
+def bfs_search(start_id, names, preset=None):
+    t_s = [start_id]
+    vis = set().union().union(preset)
+    ends = [id_name[str(start_id)]] + names
+    res = []
+    while t_s:
+        t = t_s.pop(0)
+        if id_name[str(t)] != ends[len(res)]:
+            return []
+        if id_name[str(t)] == ends[len(res)]:
+            res.append(t)
+        vis.add(t)
+        if len(res) == len(ends):
+            return res
+        if str(t) in links:
+            for link in links[str(t)]:
+                if link not in vis:
+                    t_s.append(int(link))
+    return res
+
+def bfs_search_bwd(end_id, names, preset=None):
+    t_s = [end_id]
+    vis = set().union(preset)
+    ends = [id_name[str(end_id)]] + names
+    res = []
+    while t_s:
+        t = t_s.pop(0)
+        if id_name[str(t)] != ends[len(res)]:
+            return []
+        if id_name[str(t)] == ends[len(res)]:
+            res.append(t)
+        vis.add(t)
+        if len(res) == len(ends):
+            return res
+        if int(t) in reverse_links:
+            for link in reverse_links[int(t)]:
+                if link not in vis:
+                    t_s.append(link)
+    return res
+
+def help_parse_pattern(pattern:str):
+    assert "(" not in pattern
+    top_down = True if "->" in pattern else False
+    pattern = pattern.split("<-") if not top_down else pattern.split("->")
+    return pattern, top_down
+
+def parse_pattern(pattern:str):
+    # to->linear->linear->to->(mul<-linear)->add 
+    # 返回 [-1,-1, [to, linear, linear, to, mul, linear, add], top_down], [0,4 [mul, linear], down_top]
+    res = []
+    content = re.findall(r'\(.*?\)', pattern)
+    if not content:
+        mylog.info("simple pattern")
+        p, top_down = help_parse_pattern(pattern)
+        return [[-1,-1,p,top_down]]
+    for idx, c in enumerate(content):
+        pattern = pattern.replace(c, "*")
+    fp, ftop_down = help_parse_pattern(pattern)
+    for idx, c in enumerate(content):
+        idx = fp.index("*", idx)
+        p, top_down = help_parse_pattern(c[1:-1])
+        mylog.info(p, fp, idx)
+        fp[idx] = p[0]
+        res.append([0, idx, p, top_down])
+    return [[-1,-1,fp,ftop_down]] + res
+
+def search_cur_patten(graph, links, pattern):
+    pre, node_id, p, top_down = pattern
+    start_name = p[0]
+    the_other  = p[1:]
+    next_nodes  = [[graph, None]]
+    pre_set = set() if pre == -1 else set(pre)
+    while next_nodes:
+        node, parent = next_nodes.pop(0)
+        key_id       = list(node.keys())[0]
+        if (node_id == -1 and node[key_id]['name'] == start_name) or int(node_id) == int(key_id):
+            res = bfs_search_bwd(int(key_id), the_other, pre_set) if not top_down else bfs_search(int(key_id), the_other, pre_set)
+            if not res: continue
+            return res
+        if "children" not in node[key_id] or not node[key_id]['children']:
+            continue
+        for child in node[key_id]['children']:
+            next_nodes.append([child, node])
+
+def search_pattern(graph, links, raw_pattern):
+    pattern = parse_pattern(raw_pattern)
+    res = search_cur_patten(graph, links, pattern[0])
+    if not res: return res
+    for p in pattern[1:]:
+        p[0] = res
+        idx = p[1]
+        p[1] = res[idx]
+        tmp = search_cur_patten(graph, links, p)
+        for i in tmp:
+            if i not in res:
+                res.append(i)
+    return res
+
+def build_a_fuse_op(name, depth=None, input_shape=None, output_shape=None, inputs_dtypes=None, outputs_dtypes=None,  comment=""):
+    global global_idx
+    idx = global_idx
+    global_idx += 1
+    t = {
+        "name": name,
+        "depth": depth,
+        "idx": idx,
+        "input_shape"  : input_shape,
+        "output_shape" : output_shape,
+        "input_dtype"  : inputs_dtypes,
+        "output_dtype" : outputs_dtypes,
+        "comment" : comment,
+        "children": None
+    }
+    return {str(idx): t}
+
+def handle_link(cur_id:int|str, replace_id=None):
+    cur_id = int(cur_id)
+    build_reverse_links(links)
+    father_ids = reverse_links[cur_id]
+    # import pdb;pdb.set_trace()
+    # mylog.info(f"cur_id, {cur_id}, cur_name, {id_name[str(cur_id)]}, father_ids, {father_ids}, replace_id, {replace_id}")
+    if replace_id:
+        for father_id in father_ids:
+            idx = links[father_id].index(cur_id)
+            links[father_id][idx] = int(replace_id)
+        if str(replace_id) not in links:
+            links[str(replace_id)] = links[str(cur_id)]
+        del links[str(cur_id)]
+    else:
+        for father_id in father_ids:
+            idx = links[father_id].index(cur_id)
+            links[father_id].pop(idx)
+        del links[str(cur_id)]
+    build_id_info()
+
+def build_attention_op(badbmm_op):
+    depth = badbmm_op['depth']
+    shape = badbmm_op['input_shape']
+    input_shape  = [ shape[1], shape[2] ,shape[2]]
+    output_shape = [ shape[1]]
+    input_dtype  = badbmm_op['input_dtype']
+    output_dtype = badbmm_op['output_dtype']
+    comment      = "fuse softmax(qk/d)*v op with memory efficient"
+    return build_a_fuse_op("scaled_dot_attention", depth, input_shape, output_shape, input_dtype, output_dtype, comment)
+
+def attention_match_and_rewrite(graph, links, raw_pattern="baddbmm->softmax->to->bmm"):
+    res         = search_pattern(graph, links, raw_pattern)
+    if not res: return graph, links, False
+    print(res, [ id_name[str(i)] for i in res])
+    next_nodes  = [[graph, None]]
+    attenion_op = None
+    flag        = False
+    while next_nodes:
+        node, parent = next_nodes.pop()
+        key_id       = list(node.keys())[0]
+        parent_id    = list(parent.keys())[0] if parent else None
+        if int(key_id) == int(res[0]):
+            flag = True
+            attenion_op = build_attention_op(node[key_id])
+            idx         = parent[parent_id]['children'].index(node)
+            parent[parent_id]['children'][idx] = attenion_op
+            attention_op_id = list(attenion_op.keys())[0]
+            handle_link(key_id, attention_op_id)
+        elif int(key_id) == int(res[-1]):
+            parent[parent_id]['children'].remove(node)
+            handle_link(key_id, attention_op_id)
+        elif int(key_id) in res:
+            parent[parent_id]['children'].remove(node)
+            handle_link(key_id)
+        if "children" not in node[key_id] or not node[key_id]['children']:
+            continue
+        for child in node[key_id]['children'][::-1]:
+            next_nodes.append([child, node])
+    return graph, links, flag
+
+def build_fuse_lora_op(node_id_lists):
+    to           = id_info[ str(node_id_lists[0]) ]
+    linear1      = id_info[ str(node_id_lists[1]) ]
+    linear2      = id_info[ str(node_id_lists[2]) ]
+    name         = "fuse_lora"
+    depth        = linear1['depth']
+    input_shape  = [ linear1['input_shape'][0], linear2["input_shape"][0] ]
+    output_shape = linear2['output_shape']
+    input_dtype  = [ to["input_dtype"][0], linear1['input_dtype'][0] ]
+    output_dtype = [ to["input_dtype"][0] ]
+    comment      = "fuse to->linear->linear->to->mul op"
+    return build_a_fuse_op(name, depth, input_shape, output_shape, input_dtype, output_dtype, comment)
+
+def lora_linear_match_and_rewrite(graph, links, raw_pattern="to->linear->linear->to->mul->(add<-linear)"):
+    res = search_pattern(graph, links, raw_pattern)
+    if not res: return graph, links, False
+    res = [int(i) for i in res]
+    print(res, [ id_name[str(i)] for i in res])
+    # import pdb;pdb.set_trace()
+    next_nodes = [[graph, None]]
+    flag = False
+    fuse_lora_op = None
+    fuse_lora_op_id = None
+    while next_nodes:
+        node, parent = next_nodes.pop()
+        key_id = list(node.keys())[0]
+        parent_id = list(parent.keys())[0] if parent else None
+        if int(key_id) == int(res[0]):
+            flag         = True
+            fuse_lora_op = build_fuse_lora_op(res)
+            idx          = parent[parent_id]['children'].index(node)
+            parent[parent_id]['children'][idx] = fuse_lora_op
+            fuse_lora_op_id = list(fuse_lora_op.keys())[0]
+            handle_link(key_id, fuse_lora_op_id)
+            continue
+        # elif int(key_id) == int(res[-1]):
+        #     parent[parent_id]['children'].remove(node)
+        #     handle_link(key_id)
+        #     continue
+        elif int(key_id) in res:
+            parent[parent_id]['children'].remove(node)
+            handle_link(key_id)
+            continue
+        if "children" not in node[key_id] or not node[key_id]['children']:
+            continue
+        for child in node[key_id]['children'][::-1]:
+            next_nodes.append([child, node])
+    return graph, links, flag
+
+def remove_attention_redundancy_nodes(graph, links, pattern="reshape->permute->reshape->transpose->baddbmm"):
+    res = search_pattern(graph, links, pattern)
+    # import pdb;pdb.set_trace()
+    if not res: return graph, links, False
+    print(res, [ id_name[str(i)] for i in res])
+    next_nodes = [[graph, None]]
+    flag = False
+    while next_nodes:
+        node, parent = next_nodes.pop()
+        key_id = list(node.keys())[0]
+        parent_id = list(parent.keys())[0] if parent else None
+        if int(key_id) == res[0]:
+            # import pdb;pdb.set_trace()
+            parent[parent_id]['children'].remove(node)
+            handle_link(key_id, res[-1] )
+            continue
+        elif int(key_id) in res[:-1]:
+            parent[parent_id]['children'].remove(node)
+            handle_link(key_id)
+            continue
+        elif int(key_id) == res[-1]:
+            flag = True
+            break
+        if "children" not in node[key_id] or not node[key_id]['children']:
+            continue
+        for child in node[key_id]['children'][::-1]:
+            next_nodes.append([child, node])
+    return graph, links, flag
+
+def remove_attention_redundancy_nodes2(graph, links, pattern="reshape->permute->reshape->baddbmm"):
+    return remove_attention_redundancy_nodes(graph, links, pattern)
+
+def remove_attention_redundancy_nodes3(graph, links, pattern="reshape->permute->reshape->bmm"):
+    return remove_attention_redundancy_nodes(graph, links, pattern)
+
+fuse_pattern = [
+    lora_linear_match_and_rewrite,
+    # attention_match_and_rewrite
+    remove_attention_redundancy_nodes,
+    remove_attention_redundancy_nodes2,
+    remove_attention_redundancy_nodes3,
+]
+
+def do_fuse():
+    global graph, links
+    while 1:
+        flag = False
+        for pattern in fuse_pattern:
+            graph, links, f = pattern(graph, links)
+            flag |= f
+        if not flag:
+            break
+
+fuse_pattern2 = [
+    attention_match_and_rewrite
+]
+
+def do_fuse2():
+    global graph, links
+    while 1:
+        flag = False
+        for pattern in fuse_pattern2:
+            graph, links, f = pattern(graph, links)
+            flag |= f
+        if not flag:
+            break
+
+if is_fuse:
+    do_fuse()
+    do_fuse2()
+
+
+with open("graph.json", "w") as f:
+    json.dump(graph, f, indent=4)
+import pdb;pdb.set_trace()
+
 
 def find_grad_nodes(graph):
     grad_node_ids   = []
@@ -74,8 +420,6 @@ def parse_grad_module_info(grad_module):
     return grads, grad_mem, adam_mem
 
 grads, grad_mem, adam_mem = parse_grad_module_info(grad_module)
-
-
 
 import pdb;pdb.set_trace()
 mylog.info(">>>>> find all activation node")
@@ -297,6 +641,7 @@ class layout:
         node[k]["output_shape"]= new_output_shape
         return node
 
+import pdb;pdb.set_trace()
 # init: 输入的权重，梯度权重 adam 
 weights         = total_graph.get('weights', 2041.164e6 )
 grad_weights    = grad_mem
@@ -354,7 +699,7 @@ def fix_shape_total_graph(cur_shapes):
 def get_output_mem(node):
     k = list(node.keys())[0]
     name = node[k]['name']
-    if name in ["reshape", "__getitem__", "to","chunk", "dropout", "contiguous", "float", "permute", "transpose"]:
+    if name in ["reshape", "__getitem__", "to","chunk", "contiguous", "float", "permute", "transpose"]:
         return 0
     output_shapes = node[k]['output_shape']
     output_dtype = node[k]['output_dtype']
@@ -554,6 +899,7 @@ def prepare_bwd_node_outputs_calc(res_set):
     return res_set
 
 def calc_bwd_bdc_dma(res_set):
+    build_reverse_links(links)
     backward_start = [ str(i) for i in loss_nodes]
     print("backward start",backward_start)
     grad_set = set(grad_node_ids)
@@ -594,7 +940,11 @@ def calc_all_time(res_set):
         "1684x_bwd_dma": 0,
         "2260_bwd_dma": 0,
         "1684x_bwd_tiu": 0,
-        "2260_bwd_tiu": 0
+        "2260_bwd_tiu": 0,
+        "forward_ops": 0,
+        "backward_ops": 0,
+        "total_ops": 0,
+        "2260_mac_utils": 0,
     }
     ops_total_times = defaultdict(dict)
     for k in res_set.keys():
@@ -612,6 +962,8 @@ def calc_all_time(res_set):
         total_times["2260_fwd_dma"]          += res_set[k]["2260_forward_dma_time"]
         total_times["1684x_fwd_tiu"]         += res_set[k]["1684x_forward_ops_time"]
         total_times["2260_fwd_tiu"]          += res_set[k]["2260_forward_ops_time"]
+        total_times["forward_ops"]           += res_set[k]["ops"]
+        total_times["total_ops"]             += res_set[k]["ops"]
         if "1684x_forward" not in ops_total_times[name]:
             ops_total_times[name]["1684x_forward"] = 0
             ops_total_times[name]["2260_forward"]  = 0
@@ -619,12 +971,18 @@ def calc_all_time(res_set):
             ops_total_times[name]["2260_dma"]      = 0
             ops_total_times[name]["1684x_tiu"]     = 0
             ops_total_times[name]["2260_tiu"]      = 0
+            ops_total_times[name]["forward_ops"]   = 0
+            ops_total_times[name]["forward_dma"]   = 0
+            ops_total_times[name]["fwd_count"]     = 0
         ops_total_times[name]["1684x_forward"] += res_set[k]["1684x_forward_time"]
         ops_total_times[name]["2260_forward"]  += res_set[k]["2260_forward_time"]
         ops_total_times[name]["1684x_dma"]     += res_set[k]["1684x_forward_dma_time"]
         ops_total_times[name]["2260_dma"]      += res_set[k]["2260_forward_dma_time"]
         ops_total_times[name]["1684x_tiu"]     += res_set[k]["1684x_forward_ops_time"]
         ops_total_times[name]["2260_tiu"]      += res_set[k]["2260_forward_ops_time"]
+        ops_total_times[name]["forward_ops"]   += res_set[k]["ops"]
+        ops_total_times[name]["forward_dma"]   += res_set[k]["forward_dma"]
+        ops_total_times[name]["fwd_count"]     += 1
         # backward time
         if k in activation_nodes:
             res_set[k]["1684x_backward_dma_time"] = res_set[k]["back_dma"] / params["1684x dma"]
@@ -639,20 +997,27 @@ def calc_all_time(res_set):
             total_times["2260_bwd_dma"]           += res_set[k]["2260_backward_dma_time"]
             total_times["1684x_bwd_tiu"]          += res_set[k]["1684x_backward_ops_time"]
             total_times["2260_bwd_tiu"]           += res_set[k]["2260_backward_ops_time"]
-            if "1684x_backward" not in ops_total_times["back_"+name]:
-                ops_total_times["back_"+name]["1684x_backward"] = 0
-                ops_total_times["back_"+name]["2260_backward"]  = 0
-                ops_total_times["back_"+name]["1684x_dma"]      = 0
-                ops_total_times["back_"+name]["2260_dma"]       = 0
-                ops_total_times["back_"+name]["1684x_tiu"]      = 0
-                ops_total_times["back_"+name]["2260_tiu"]       = 0
-            ops_total_times["back_"+name]["1684x_backward"] += max(res_set[k]["1684x_backward_ops_time"], res_set[k]["1684x_backward_dma_time"])
-            ops_total_times["back_"+name]["2260_backward"]  += max(res_set[k]["2260_backward_ops_time"], res_set[k]["2260_backward_dma_time"])
-            ops_total_times["back_"+name]["1684x_dma"]      += res_set[k]["1684x_backward_dma_time"]
-            ops_total_times["back_"+name]["2260_dma"]       += res_set[k]["2260_backward_dma_time"]
-            ops_total_times["back_"+name]["1684x_tiu"]      += res_set[k]["1684x_backward_ops_time"]
-            ops_total_times["back_"+name]["2260_tiu"]       += res_set[k]["2260_backward_ops_time"]
-
+            total_times["backward_ops"]           += res_set[k]["back_ops"]
+            total_times["total_ops"]              += res_set[k]["back_ops"]
+            if "1684x_backward" not in ops_total_times[name]:
+                ops_total_times[name]["1684x_backward"] = 0
+                ops_total_times[name]["2260_backward"]  = 0
+                ops_total_times[name]["1684x_bwd_dma"]  = 0
+                ops_total_times[name]["2260_bwd_dma"]   = 0
+                ops_total_times[name]["1684x_bwd_tiu"]  = 0
+                ops_total_times[name]["2260_bwd_tiu"]   = 0
+                ops_total_times[name]["backward_ops"]   = 0
+                ops_total_times[name]["backward_dma"]   = 0
+                ops_total_times[name]["bwd_count"]      = 0
+            ops_total_times[name]["1684x_backward"] += max(res_set[k]["1684x_backward_ops_time"], res_set[k]["1684x_backward_dma_time"])
+            ops_total_times[name]["2260_backward"]  += max(res_set[k]["2260_backward_ops_time"],  res_set[k]["2260_backward_dma_time"])
+            ops_total_times[name]["1684x_bwd_dma"]      += res_set[k]["1684x_backward_dma_time"]
+            ops_total_times[name]["2260_bwd_dma"]       += res_set[k]["2260_backward_dma_time"]
+            ops_total_times[name]["1684x_bwd_tiu"]      += res_set[k]["1684x_backward_ops_time"]
+            ops_total_times[name]["2260_bwd_tiu"]       += res_set[k]["2260_backward_ops_time"]
+            ops_total_times[name]["backward_ops"]       += res_set[k]["back_ops"]
+            ops_total_times[name]["backward_dma"]       += res_set[k]["back_dma"]
+            ops_total_times[name]["bwd_count"]          += 1
     return res_set, total_times, ops_total_times
 
 def write_to_sheet(ws, data, start_row, start_col):
@@ -738,6 +1103,8 @@ for nb, nw in product(batchs, whr):
     ops_times_df.loc["total"] = ops_times_df.sum()
     total_times["1684x_total_time"]           = total_times["1684x_forward"] + total_times["1684x_backward"]
     total_times["2260_total_time"]            = total_times["2260_forward"]  + total_times["2260_backward"]
+    total_times["1684x_mac_utils"]            = total_times["total_ops"] * 100 / total_times["1684x_total_time"] / params["1684x f16 tiu"]
+    total_times["2260_mac_utils"]             = total_times["total_ops"] * 100 / total_times["2260_total_time"] / params["2260 f16 tiu"]
     total_times["total_activation"]           = graph_mem
     summary_table[shape_tuple]["total"]       = total_times
     summary_table[shape_tuple]["ops_times"]   = ops_times_df
@@ -757,6 +1124,8 @@ for k in summary_table.keys():
 
 
 total_shape_tb     = pd.DataFrame(all_shape_total_table)
+# 保存两位小数
+total_shape_tb     = total_shape_tb.applymap(lambda x: round(x, 2))
 # 排序 index 排序 
 total_shape_tb     = total_shape_tb.sort_index()
 total_shape_mem_tb = pd.DataFrame(all_shape_mem_table)
@@ -788,13 +1157,13 @@ for k in summary_table.keys():
     fwd_bwd_df = summary_table[k]["fwd_bwd_df"]
     last_row = write_to_sheet(ws, fwd_bwd_df, last_row+2, 5)
 
-wb.save("output.xlsx")
+wb.save(output_file_name+".xlsx")
 # total_shape_op_tb  = pd.DataFrame(all_shape_ops_table)
 
 
-import ipdb;ipdb.set_trace()
+# import ipdb;ipdb.set_trace()
 
 
-# group by path_1, path_2, path_3, path_4
+# # group by path_1, path_2, path_3, path_4
 
-import pdb;pdb.set_trace()
+# import pdb;pdb.set_trace()
