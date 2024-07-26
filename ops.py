@@ -58,6 +58,8 @@ def element_wise_op_calc(node):
     name = node["name"]
     rate = dma_ops_info[name]["op_rate"]
     node["ops"] = rate * np.prod(node['output_shape'][0])
+    node["cube_ops"] = 0
+    node["vector_ops"] = node["ops"]
     return node
 
 def linear_dma_op_calc(node):
@@ -78,11 +80,13 @@ def norm_dma_op_calc(node):
     ops     = np.prod(node['input_shape'][0]) * op_rate
     dim     = node["input_shape"][0][-1]
     if affine:
-        s2l_dma += 2*dim*dtype_len
-        ops      = np.prod(node['input_shape'][0]) * (op_rate + 2 )
-    node["s2l_dma"] = s2l_dma
-    node["l2s_dma"] = l2s_dma
-    node["ops"]     = ops
+        s2l_dma        += 2*dim*dtype_len
+        ops             = np.prod(node['input_shape'][0]) * (op_rate + 2 )
+    node["s2l_dma"]    = s2l_dma
+    node["l2s_dma"]    = l2s_dma
+    node["ops"]        = ops
+    node["cube_ops"]   = 0
+    node["vector_ops"] = ops
     return node
 
 def basic_dma_op(node):
@@ -100,9 +104,13 @@ def basic_dma_op(node):
         element_wise_op_calc(node)
     elif dma_ops_info[node["name"]]["only_dma"]:
         node["ops"] = 0
+        node["cube_ops"] = 0
+        node["vector_ops"] = 0
         return node
     elif dma_ops_info[node["name"]]["linear_op"]:
         node["ops"] = linear_dma_op_calc(node)
+        node["cube_ops"] = node["ops"]
+        node["vector_ops"] = 0
     else:
         print(node["name"], "not support yet")
     return node
@@ -163,7 +171,9 @@ def baddbmm_dma_op(node):
     node["s2l_dma"] = s2l_dma
     node["l2s_dma"] = l2s_dma
     # alpha * batch1 @ batch2 + input * belta
-    ops = np.prod(node["input_shape"][1]) * node["input_shape"][2][-1] + np.prod(node["input_shape"][0]) * 1
+    ops = np.prod(node["input_shape"][1]) * node["input_shape"][2][-1] + np.prod(node["input_shape"][0]) * 2
+    node["vector_ops"] = np.prod(node["output_shape"][0]) * 2
+    node["cube_ops"]   = ops - node["vector_ops"]
     node["ops"] = ops
     return node
 
@@ -188,7 +198,9 @@ def fuse_lora_dma_op(node):
     ops          += np.prod(input_shape[0]) * lora_rank * 8
     ops          += np.prod(lora_rank) * kernel_shape[1] * 8
     ops          += np.prod(output_shape[0]) * 2
-    node["ops"]  = ops
+    node["vector_ops"] = np.prod(output_shape[0]) * 2
+    node["ops"]        = ops
+    node["cube_ops"]   = ops - node["vector_ops"]
     return node
 
 @warp_dma_op_shape_node(special_op=True)
@@ -211,7 +223,9 @@ def scaled_dot_attention_dma_op(node):
     ops += np.prod(shape0) * shape1[2] # q * k
     ops += np.prod(temp) * 7 # / sqrt(d_k) + softmax + mask
     ops += np.prod(temp) * shape2[1] # v * softmax
-    node["ops"] = ops
+    node["vector_ops"] = np.prod(temp) * 7
+    node["ops"]        = ops
+    node["cube_ops"]   = ops - node["vector_ops"]
     return node
 
 @warp_dma_op_shape_node(layout=[[layout.n_model_h_w, 
@@ -245,7 +259,9 @@ def conv2d_dma_op(node):
     node["reorder_weight_dma"] = np.prod(kernel_reorder) * dtype_len
     node["s2l_dma"] = s2l_dma
     node["l2s_dma"] = l2s_dma
-    node["ops"]     = np.prod(output_shape[0]) * kernel_size[0] * kernel_size[1] * ic
+    node["ops"]     = np.prod(output_shape[0]) * kernel_size[0] * kernel_size[1] * ic + np.prod(input_shape[0]) * oc
+    node["cube_ops"]   = np.prod(output_shape[0]) * kernel_size[0] * kernel_size[1] * ic
+    node["vector_ops"] = np.prod(input_shape[0]) * oc
     return node
 
 @warp_dma_op_shape_node(layout=[[layout.n_model]],element_wise_op=True, op_rate=5)
@@ -263,6 +279,8 @@ def dropout_dma_op(node):
     node["s2l_dma"] = s2l_dma
     node["l2s_dma"] = l2s_dma
     node["ops"]     = np.prod(node['input_shape'][0])
+    node["cube_ops"] = 0
+    node["vector_ops"] = node["ops"]
     return node
 
 @warp_dma_op_shape_node(layout=[[layout.n_model_h_w, 
@@ -297,6 +315,8 @@ def getitem_dma_op(node):
     node["ops"] = 0
     node["s2l_dma"] = 0
     node["l2s_dma"] = 0
+    node["cube_ops"] = 0
+    node["vector_ops"] = 0
     return node
 
 ops_info["__getitem__"] = getitem_dma_op
@@ -327,6 +347,8 @@ def linear_dma_op(node):
     node["s2l_dma"] = s2l_dma
     node["l2s_dma"] = l2s_dma
     node["ops"]     = ops
+    node["cube_ops"] = ops
+    node["vector_ops"] = 0
     return node
 
 @warp_dma_op_shape_node(layout=[[layout.n_hw_model, layout.n_model ]], norm_op=True, op_rate=5)
@@ -375,6 +397,8 @@ def to_dma_op(node):
         node["s2l_dma"] = np.prod(node['input_shape'][0]) * dtype_map[input_dtype]
         node["l2s_dma"] = np.prod(node['output_shape'][0]) * dtype_map[output_dtype]
     node["ops"] = 0
+    node["cube_ops"]   = 0
+    node["vector_ops"] = 0
     return node
 
 @warp_dma_op_shape_node(only_dma=True)
@@ -628,8 +652,8 @@ def calc_dma_backops(node):
     return node
 
 def back_warp_node(special_fn = False, 
-                   output_num=1,
-                   only_dma=False
+                   output_num = 1,
+                   only_dma   = False
                    ):
     def _warp_node(fn):
         name      = fn.__name__
@@ -705,6 +729,8 @@ def back_add_node(node):
     back_ops     += sum_grad(output_shape, right) * (1 in back_grad_idx)
     # output shape is same as input shape ?
     node["back_ops"] = back_ops
+    node["back_cube_ops"] = 0
+    node["back_vector_ops"] = back_ops
     return node
 
 @back_warp_node(output_num=1)
@@ -721,8 +747,8 @@ def back_fuse_lora_node(node):
     dtype_len    = dtype_map[node['input_dtype'][0]]
     dma  = 0
     dma += np.prod(input_shape[0]) * dtype_len * 2
-    dma += np.prod(kernel_shape) * dtype_len
-    dma += np.prod(lora_up) * dtype_len * 2 * 2   #consider f32
+    dma += np.prod(kernel_shape)   * dtype_len
+    dma += np.prod(lora_up)   * dtype_len * 2 * 2   #consider f32
     dma += np.prod(lora_down) * dtype_len * 2 * 2 #consider f32
     node["back_dma"] = dma
     ops = 0
@@ -731,8 +757,10 @@ def back_fuse_lora_node(node):
     ops += np.prod(input_shape) * kernel_shape[1] # add
     ops += np.prod(input_shape) * (lora_rank + 1) * 8
     ops += np.prod( [input_shape[0], input_shape[1], lora_rank ] ) * kernel_shape[1] * 8
-    ops += np.prod(input_shape)
+    ops += np.prod(input_shape) * 2
     node["back_ops"] = ops
+    node["back_vector_ops"] = np.prod(input_shape) * 2
+    node["back_cube_ops"]   = ops - node["back_vector_ops"]
     return node
 
 @back_warp_node(output_num=3)
@@ -772,7 +800,9 @@ def back_scaled_dot_attention_node(node):
     # then compute grad k
     ops += help_mul_ops_dma(q, temp, True, False) * (1 in back_grad_idx)
     node["back_ops"] = ops
-    node["back_recompute"] = temp_ops
+    node["back_recompute"]  = temp_ops
+    node["back_vector_ops"] = np.prod(temp) * 7 * ((0 in back_grad_idx) | (1 in back_grad_idx))
+    node["back_cube_ops"]   = ops - temp_ops
     return node
 
 @back_warp_node(special_fn=True, output_num=2)
@@ -791,6 +821,8 @@ def back_bmm_node(node):
     back_ops     += help_mul_ops_dma(output_shape, right, False, True) * (0 in back_grad_idx) * (0 in back_grad_idx)
     back_ops     += help_mul_ops_dma(left, output_shape, True, False) * (1 in back_grad_idx) * (1 in back_grad_idx)
     node["back_ops"] = back_ops
+    node["back_cube_ops"] = node["back_ops"]
+    node["back_vector_ops"] = 0
     return node
 
 @back_warp_node(special_fn=True, output_num=3)
@@ -806,10 +838,12 @@ def back_baddbmm_node(node):
     A               = input_shape[1]
     B               = input_shape[2]
     back_ops        = 0
-    back_ops        += np.prod(C) * (0 in back_grad_idx)
+    back_ops        += np.prod(C) * (0 in back_grad_idx) + np.prod(output_shape) * 2 * (0 in back_grad_idx)
     back_ops        += help_mul_ops_dma(output_shape, B, False, True) * (1 in back_grad_idx)
     back_ops        += help_mul_ops_dma(A, output_shape, True, False) * (2 in back_grad_idx)
     node["back_ops"] = back_ops
+    node["back_vector_ops"] = np.prod(output_shape) * 2
+    node["back_cube_ops"] = node["back_ops"] - node["back_vector_ops"]
     return node
 
 @back_warp_node(only_dma=True, output_num=2)
@@ -828,6 +862,8 @@ def back_chunk_node(node):
     output_shape = node['output_shape']
     back_ops = 0
     node["back_ops"] = back_ops
+    node["back_cube_ops"] = 0
+    node["back_vector_ops"] = back_ops
     return node
 
 @back_warp_node(only_dma=True, output_num=1)
@@ -858,7 +894,9 @@ def back_conv2d_node( node ):
     back_ops     += conv_ops(input_shape, kernel_shape) * (0 in back_grad_idx)
     back_ops     += conv_ops(kernel_shape, output_shape) * (1 in back_grad_idx)
     back_ops     += np.prod(output_shape) * (2 in back_grad_idx)
-    node["back_ops"] = back_ops
+    node["back_ops"]        = back_ops
+    node["back_vector_ops"] = np.prod(output_shape) * (2 in back_grad_idx)
+    node["back_cube_ops"]   = back_ops - node["back_vector_ops"]
     return node
 
 @back_warp_node(special_fn=False, output_num=1)
@@ -871,7 +909,10 @@ def back_cos_node(node):
     back_grad_idx = node['back_grad_idx']
     back_ops = 0
     back_ops += np.prod(input_shape) * (0 in back_grad_idx)
-    return basic_node(node)
+    node["back_ops"] = back_ops
+    node["back_cube_ops"] = 0
+    node["back_vector_ops"] = back_ops
+    return node
 
 @back_warp_node(special_fn=True, output_num=1)
 def back_dropout_node(node):
@@ -883,6 +924,8 @@ def back_dropout_node(node):
     ops = 0
     ops += np.prod(input_shape) * 2
     node["back_ops"] = ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 # boardcast
@@ -898,6 +941,8 @@ def back_div_node(node):
     back_ops += sum_grad(output_shape, input_shape[0]) * (0 in back_grad_idx)
     back_ops += sum_grad(output_shape, input_shape[1]) * (1 in back_grad_idx)
     node["back_ops"] = back_ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(special_fn=True, output_num=1)
@@ -910,6 +955,8 @@ def back_expand_node(node):
     back_grad_idx = node['back_grad_idx']
     back_ops = 0
     node["back_ops"] = back_ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(special_fn=False, output_num=1)
@@ -923,23 +970,26 @@ def back_exp_node(node):
     back_ops = 0
     back_ops += np.prod(input_shape) * (0 in back_grad_idx)
     node["back_ops"] = back_ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(special_fn=False, output_num=1)
 def back_empty_pass_node(node):
     
     node["back_ops"] = 0
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(special_fn=True, output_num=1)
 def back_float_node(node):
     # c = a.float()
     # grad_a = grad_c
-    
-    input_shape = node['input_shape']
-    output_shape = node['output_shape']
     ops = 0
     node["back_ops"] = ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(special_fn=True, output_num=3)
@@ -958,13 +1008,16 @@ def back_group_norm_node(node):
     ops += np.prod(input_shape) * (1 in back_grad_idx)
     ops += np.prod(input_shape) * (2 in back_grad_idx)
     node["back_ops"] = ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node()
 def back_getitem_node(node):
     ops = 0
-    
     node["back_ops"] = ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 backward_node_fn["__getitem__"] = back_getitem_node
@@ -974,12 +1027,13 @@ backward_node_fn["empty-pass"]  = back_getitem_node
 def back_gelu_node(node):
     # c = F.gelu(a)
     # grad_a = grad_c * (0.5 * (1 + torch.erf(a / math.sqrt(2))))
-    
     input_shape  = node['input_shape']
     output_shape = node['output_shape']
     ops = 0
     ops += np.prod(input_shape) * 5
     node["back_ops"] = ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(special_fn=False, output_num=1)
@@ -991,6 +1045,8 @@ def back_interpolate_node(node):
     ops = 0
     ops += np.prod(output_shape) * 8
     node["back_ops"] = ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(special_fn=True, output_num=2)
@@ -1001,7 +1057,6 @@ def back_linear_node(node):
     # grad_bias = sum(grad_c, axis=0)
     # use batch to show have/not bias
     # Linear(in_features=320, out_features=320, bias=True)
-    
     input_shape  = node['input_shape'][0]
     output_shape = node['output_shape'][0]
     back_grad_idx = node['back_grad_idx']
@@ -1011,6 +1066,8 @@ def back_linear_node(node):
     ops += help_mul_ops_dma(output_shape, input_shape, True, False) * (1 in back_grad_idx)
     ops += np.prod(weight_shape) * (2 in back_grad_idx)
     node["back_ops"] = ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(special_fn=True, output_num=2)
@@ -1020,7 +1077,6 @@ def back_layer_norm_node(node):
     # grad_weight = F.layer_norm(a, [320], grad_c, None, eps=1e-05)
     # grad_bias = sum(grad_c)
     # LayerNorm(320, eps=1e-05, elementwise_affine=True)
-    
     info     = node['info']
     input_shape = handle_input_shape(node['input_shape'])
     ops = 0
@@ -1029,6 +1085,8 @@ def back_layer_norm_node(node):
     ops += np.prod(input_shape) * (1 in back_grad_idx)
     ops += np.prod(input_shape) * (2 in back_grad_idx)
     node["back_ops"] = ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(special_fn=True, output_num=2)
@@ -1044,6 +1102,8 @@ def back_mul_node(node):
     if 1 in back_grad_idx:
         back_ops += sum_grad(output_shape, input_shape[1])
     node["back_ops"] = back_ops
+    node["back_cube_ops"]   = node["back_ops"]
+    node["back_vector_ops"] = 0
     return node
 
 @back_warp_node(only_dma=True, output_num=1)
@@ -1051,14 +1111,17 @@ def back_permute_node(node):
     # c = a.permute(1, 0, 2)
     # grad_a = grad_c.permute(1, 0, 2)
     node["back_ops"] = 0
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(only_dma=True, output_num=1)
 def back_reshape_node(node):
     # c = a.reshape(1, 320, 320)
     # grad_a = grad_c.reshape(a.shape)
-    
     node["back_ops"] = 0
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(output_num=1)
@@ -1071,6 +1134,8 @@ def back_silu_node(node):
     ops = 0
     ops += np.prod(input_shape) * 6
     node["back_ops"] = ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(output_num=1)
@@ -1084,6 +1149,8 @@ def back_sin_node(node):
     back_ops = 0
     back_ops += np.prod(input_shape) * 6 * (0 in back_grad_idx)
     node["back_ops"] = back_ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(output_num=1)
@@ -1096,6 +1163,8 @@ def back_softmax_node(node):
     back_ops = 0
     back_ops += np.prod(input_shape) * 5
     node["back_ops"] = back_ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(output_num=1, only_dma=True)
@@ -1106,6 +1175,8 @@ def back_to_node(node):
     back_ops = 0
     node["back_ops"] = back_ops
     node["back_dma"] = 0 if input_dtype == output_dtype else node["back_dma"]
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
 
 @back_warp_node(output_num=1, only_dma=True)
@@ -1114,5 +1185,7 @@ def back_transpose_node(node):
     output_shape = node['output_shape']
     back_ops = 0
     node["back_ops"] = back_ops
+    node["back_cube_ops"]   = 0
+    node["back_vector_ops"] = node["back_ops"]
     return node
  

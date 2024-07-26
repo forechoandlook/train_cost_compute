@@ -395,6 +395,60 @@ def remove_empty_module():
 
 remove_empty_module()
 
+
+# find a transformer 
+# from layernorm to layernorm
+# def find_transformer():
+#     next_nodes = [[graph, None]]
+#     transformer_nodes = []
+#     more_transformer = []
+#     flag = False
+#     while next_nodes:
+#         node, parent = next_nodes.pop()
+#         key_id = list(node.keys())[0]
+#         if node[key_id]['name'] == "conv2d":
+#             if flag:
+#                 more_transformer.append(transformer_nodes)
+#                 transformer_nodes = []
+#             else:
+#                 flag = True
+#         if "children" not in node[key_id] or node[key_id]['children'] == None:
+#             if node[key_id]['name'] == "conv2d":
+#                 flag = False
+#                 transformer_nodes = []
+#             if flag:
+#                 transformer_nodes.append(key_id)
+#             continue
+#         for child in node[key_id]['children'][::-1]:
+#             next_nodes.append([child, node])
+#     return more_transformer
+
+def find_transformer():
+    next_nodes = [[graph, None]]
+    res = []
+    single_basic_transformer = []
+    flag = False
+    while next_nodes:
+        node, parent = next_nodes.pop()
+        key_id = list(node.keys())[0]
+        if node[key_id]['name'] == "BasicTransformerBlock":
+            flag = True
+        if node[key_id]["name"] == "Transformer2DModel":
+            if flag:
+                res.append(single_basic_transformer)
+                single_basic_transformer = []
+                flag = False
+            flag = False
+        if "children" not in node[key_id] or node[key_id]['children'] == None:
+            if flag:
+                single_basic_transformer.append(key_id)
+            continue
+        for child in node[key_id]['children'][::-1]:
+            next_nodes.append([child, node])
+    return res
+
+do_select = True
+need_calc_nodes = find_transformer()[0] # debug 
 # with open("graph.json", "w") as f:
 #     json.dump(graph, f, indent=4)
 # import pdb;pdb.set_trace()
@@ -842,6 +896,8 @@ def forward_dma_ops_calc():
         res_node['input_dtype']        = node[node_key]['input_dtype']
         res_node['output_dtype']       = node[node_key]['output_dtype']
         res_node["ops"]                = node[node_key]["ops"]
+        res_node["vector_ops"]         = node[node_key]["vector_ops"]
+        res_node["cube_ops"]           = node[node_key]["cube_ops"]
         res_node["s2l_dma"]            = node[node_key]["s2l_dma"]
         res_node["l2s_dma"]            = node[node_key]["l2s_dma"]
         res_node["input_shape_layout"] = node[node_key]["input_shape_layout"]
@@ -992,50 +1048,98 @@ def calc_bwd_grad_chain(res_set):
     print("grad add count", grad_add_count)
     return res_set
 
+def handle_tiu_time_calc(res_set,k):
+    rate = params["1684x f32 tiu"] / params["1684x f16 tiu"]
+    res_set[k]["1684x_forward_tiu_vec_time"]  = (res_set[k]["vector_ops"] / params["1684x vector tiu"]) * 1 if res_set[k]["input_dtype"][0] == "float16" else rate 
+    res_set[k]["1684x_forward_tiu_cube_time"] = (res_set[k]["cube_ops"] / params["1684x cuba tiu"]) * 1 if res_set[k]["input_dtype"][0] == "float16" else rate
+    res_set[k]["1684x_forward_ops_time"]      = res_set[k]["1684x_forward_tiu_vec_time"] + res_set[k]["1684x_forward_tiu_cube_time"]
+    res_set[k]["2260_forward_tiu_vec_time"]   = (res_set[k]["vector_ops"] / params["2260 vector tiu"]) * 1 if res_set[k]["input_dtype"][0] == "float16" else rate
+    res_set[k]["2260_forward_tiu_cube_time"]  = (res_set[k]["cube_ops"] / params["2260 cuba tiu"]) * 1 if res_set[k]["input_dtype"][0] == "float16" else rate
+    res_set[k]["2260_forward_ops_time"]       = res_set[k]["2260_forward_tiu_vec_time"] + res_set[k]["2260_forward_tiu_cube_time"]
+
+def handle_bwd_tiu_time_calc(res_set,k):
+    rate = params["1684x f32 tiu"] / params["1684x f16 tiu"]
+    res_set[k]["1684x_backward_tiu_vec_time"]  = (res_set[k]["back_vector_ops"] / params["1684x vector tiu"])   * 1 if res_set[k]["input_dtype"][0] == "float16" else rate
+    res_set[k]["1684x_backward_tiu_cube_time"] = (res_set[k]["back_cube_ops"] / params["1684x cuba tiu"])       * 1 if res_set[k]["input_dtype"][0] == "float16" else rate
+    res_set[k]["1684x_backward_ops_time"]      = res_set[k]["1684x_backward_tiu_vec_time"] + res_set[k]["1684x_backward_tiu_cube_time"]
+    res_set[k]["2260_backward_tiu_vec_time"]   = (res_set[k]["back_vector_ops"] / params["2260 vector tiu"])    * 1 if res_set[k]["input_dtype"][0] == "float16" else rate
+    res_set[k]["2260_backward_tiu_cube_time"]  = (res_set[k]["back_cube_ops"] / params["2260 cuba tiu"])        * 1 if res_set[k]["input_dtype"][0] == "float16" else rate
+    res_set[k]["2260_backward_ops_time"]       = res_set[k]["2260_backward_tiu_vec_time"] + res_set[k]["2260_backward_tiu_cube_time"]
+
+def handle_grad_add_time_calc(res_set,k):
+    rate = params["1684x f32 tiu"] / params["1684x f16 tiu"]
+    res_set[k]["grad_add_1684x_backward_tiu_vec_time"]  = (res_set[k]["grad_chain_ops"] / params["1684x vector tiu"])   * 1 if res_set[k]["input_dtype"][0] == "float16" else rate
+    res_set[k]["grad_add_1684x_backward_tiu_cube_time"] = 0
+    res_set[k]["grad_add_1684x_backward_ops_time"]      = res_set[k]["grad_add_1684x_backward_tiu_vec_time"] + res_set[k]["grad_add_1684x_backward_tiu_cube_time"]
+    res_set[k]["grad_add_2260_backward_tiu_vec_time"]   = (res_set[k]["grad_chain_ops"] / params["2260 vector tiu"])    * 1 if res_set[k]["input_dtype"][0] == "float16" else rate
+    res_set[k]["grad_add_2260_backward_tiu_cube_time"]  = 0
+    res_set[k]["grad_add_2260_backward_ops_time"]       = res_set[k]["grad_add_2260_backward_tiu_vec_time"] + res_set[k]["grad_add_2260_backward_tiu_cube_time"]
+
 def calc_all_time(res_set):
     total_times = {
-        "1684x_forward": 0,
-        "2260_forward": 0,
+        "1684x_forward" : 0,
+        "2260_forward"  : 0,
         "1684x_backward": 0,
-        "2260_backward": 0,
-        "1684x_fwd_dma": 0,
+        "2260_backward" : 0,
+        "1684x_fwd_dma" : 0,
         "2260_fwd_dma": 0,
         "1684x_fwd_tiu": 0,
+        "1684x_fwd_tiu_vec": 0,
+        "1684x_fwd_tiu_cube": 0,
         "2260_fwd_tiu": 0,
+        "2260_fwd_tiu_vec": 0,
+        "2260_fwd_tiu_cube": 0,
         "1684x_bwd_dma": 0,
         "2260_bwd_dma": 0,
         "1684x_bwd_tiu": 0,
+        "1684x_bwd_tiu_vec": 0,
+        "1684x_bwd_tiu_cube": 0,
         "2260_bwd_tiu": 0,
+        "2260_bwd_tiu_vec": 0,
+        "2260_bwd_tiu_cube": 0,
         "forward_ops": 0,
         "backward_ops": 0,
         "total_ops": 0,
+        "total_dma": 0,
         "2260_mac_utils": 0,
     }
     ops_total_times = defaultdict(dict)
     for k in res_set.keys():
+        if k not in need_calc_nodes and do_select:
+            continue
         # forward time 
         name = res_set[k]["name"]
-        res_set[k]["1684x_forward_dma_time"] = res_set[k]["forward_dma"] / params["1684x dma"]
-        res_set[k]["2260_forward_dma_time"]  = res_set[k]["forward_dma"] / params["2260 dma"]
-        res_set[k]["1684x_forward_ops_time"] = res_set[k]["ops"] / (params["1684x f16 tiu"] if res_set[k]["input_dtype"][0] == "float16" else params["1684x f32 tiu"])
-        res_set[k]["2260_forward_ops_time"]  = res_set[k]["ops"] / (params["2260 f16 tiu"]  if res_set[k]["input_dtype"][0] == "float16" else params["2260 f32 tiu"])
-        res_set[k]["1684x_forward_time"]     = max(res_set[k]["1684x_forward_dma_time"],res_set[k]["1684x_forward_ops_time"])
-        res_set[k]["2260_forward_time"]      = max(res_set[k]["2260_forward_dma_time"],res_set[k]["2260_forward_ops_time"])
-        total_times["1684x_forward"]         += res_set[k]["1684x_forward_time"]
-        total_times["2260_forward"]          += res_set[k]["2260_forward_time"]
-        total_times["1684x_fwd_dma"]         += res_set[k]["1684x_forward_dma_time"]
-        total_times["2260_fwd_dma"]          += res_set[k]["2260_forward_dma_time"]
-        total_times["1684x_fwd_tiu"]         += res_set[k]["1684x_forward_ops_time"]
-        total_times["2260_fwd_tiu"]          += res_set[k]["2260_forward_ops_time"]
-        total_times["forward_ops"]           += res_set[k]["ops"]
-        total_times["total_ops"]             += res_set[k]["ops"]
+        res_set[k]["1684x_forward_dma_time"]   = res_set[k]["forward_dma"] / params["1684x dma"]
+        res_set[k]["2260_forward_dma_time"]    = res_set[k]["forward_dma"] / params["2260 dma"]
+        # res_set[k]["1684x_forward_ops_time"]   = res_set[k]["ops"] / (params["1684x f16 tiu"] if res_set[k]["input_dtype"][0] == "float16" else params["1684x f32 tiu"])
+        # res_set[k]["2260_forward_ops_time"]    = res_set[k]["ops"] / (params["2260 f16 tiu"]  if res_set[k]["input_dtype"][0] == "float16" else params["2260 f32 tiu"])
+        handle_tiu_time_calc(res_set, k)
+        res_set[k]["1684x_forward_time"]       = max(res_set[k]["1684x_forward_dma_time"],res_set[k]["1684x_forward_ops_time"])
+        res_set[k]["2260_forward_time"]        = max(res_set[k]["2260_forward_dma_time"],res_set[k]["2260_forward_ops_time"])
+        total_times["1684x_forward"]           += res_set[k]["1684x_forward_time"]
+        total_times["2260_forward"]            += res_set[k]["2260_forward_time"]
+        total_times["1684x_fwd_dma"]           += res_set[k]["1684x_forward_dma_time"]
+        total_times["2260_fwd_dma"]            += res_set[k]["2260_forward_dma_time"]
+        total_times["1684x_fwd_tiu"]           += res_set[k]["1684x_forward_ops_time"]
+        total_times["1684x_fwd_tiu_vec"]       += res_set[k]["1684x_forward_tiu_vec_time"]
+        total_times["1684x_fwd_tiu_cube"]      += res_set[k]["1684x_forward_tiu_cube_time"]
+        total_times["2260_fwd_tiu"]            += res_set[k]["2260_forward_ops_time"]
+        total_times["2260_fwd_tiu_vec"]        += res_set[k]["2260_forward_tiu_vec_time"]
+        total_times["2260_fwd_tiu_cube"]       += res_set[k]["2260_forward_tiu_cube_time"]
+        total_times["forward_ops"]             += res_set[k]["ops"]
+        total_times["total_ops"]               += res_set[k]["ops"]
+        total_times["total_dma"]               += res_set[k]["forward_dma"]
         if "1684x_forward" not in ops_total_times[name]:
             ops_total_times[name]["1684x_forward"] = 0
             ops_total_times[name]["2260_forward"]  = 0
             ops_total_times[name]["1684x_dma"]     = 0
             ops_total_times[name]["2260_dma"]      = 0
             ops_total_times[name]["1684x_tiu"]     = 0
+            ops_total_times[name]["1684x_tiu_vec"] = 0
+            ops_total_times[name]["1684x_tiu_cube"]= 0
             ops_total_times[name]["2260_tiu"]      = 0
+            ops_total_times[name]["2260_tiu_vec"]  = 0
+            ops_total_times[name]["2260_tiu_cube"] = 0
             ops_total_times[name]["forward_ops"]   = 0
             ops_total_times[name]["forward_dma"]   = 0
             ops_total_times[name]["fwd_count"]     = 0
@@ -1044,16 +1148,21 @@ def calc_all_time(res_set):
         ops_total_times[name]["1684x_dma"]     += res_set[k]["1684x_forward_dma_time"]
         ops_total_times[name]["2260_dma"]      += res_set[k]["2260_forward_dma_time"]
         ops_total_times[name]["1684x_tiu"]     += res_set[k]["1684x_forward_ops_time"]
+        ops_total_times[name]["1684x_tiu_vec"] += res_set[k]["1684x_forward_tiu_vec_time"]
+        ops_total_times[name]["1684x_tiu_cube"]+= res_set[k]["1684x_forward_tiu_cube_time"]
         ops_total_times[name]["2260_tiu"]      += res_set[k]["2260_forward_ops_time"]
+        ops_total_times[name]["2260_tiu_vec"]  += res_set[k]["2260_forward_tiu_vec_time"]
+        ops_total_times[name]["2260_tiu_cube"] += res_set[k]["2260_forward_tiu_cube_time"]
         ops_total_times[name]["forward_ops"]   += res_set[k]["ops"]
         ops_total_times[name]["forward_dma"]   += res_set[k]["forward_dma"]
         ops_total_times[name]["fwd_count"]     += 1
         # backward time
         if k in activation_nodes:
-            res_set[k]["1684x_backward_dma_time"] = (res_set[k]["back_dma"] + res_set[k]["grad_chain_dma"] if "grad_chain_dma" in res_set[k] else res_set[k]["back_dma"]) / params["1684x dma"]
-            res_set[k]["2260_backward_dma_time"]  = (res_set[k]["back_dma"] + res_set[k]["grad_chain_dma"] if "grad_chain_dma" in res_set[k] else res_set[k]["back_dma"]) / params["2260 dma"]
-            res_set[k]["1684x_backward_ops_time"] = (res_set[k]["back_ops"] + res_set[k]["grad_chain_ops"] if "grad_chain_ops" in res_set[k] else res_set[k]["back_ops"]) / (params["1684x f16 tiu"] if res_set[k]["input_dtype"][0] == "float16" else params["1684x f32 tiu"])
-            res_set[k]["2260_backward_ops_time"]  = (res_set[k]["back_ops"] + res_set[k]["grad_chain_ops"] if "grad_chain_ops" in res_set[k] else res_set[k]["back_ops"]) / (params["2260 f16 tiu"]  if res_set[k]["input_dtype"][0] == "float16" else params["2260 f32 tiu"])
+            res_set[k]["1684x_backward_dma_time"] = res_set[k]["back_dma"] / params["1684x dma"]
+            res_set[k]["2260_backward_dma_time"]  = res_set[k]["back_dma"] / params["2260 dma"]
+            # res_set[k]["1684x_backward_ops_time"] = res_set[k]["back_ops"] / (params["1684x f16 tiu"] if res_set[k]["input_dtype"][0] == "float16" else params["1684x f32 tiu"])
+            # res_set[k]["2260_backward_ops_time"]  = res_set[k]["back_ops"] / (params["2260 f16 tiu"]  if res_set[k]["input_dtype"][0] == "float16" else params["2260 f32 tiu"])
+            handle_bwd_tiu_time_calc(res_set,k)
             res_set[k]["1684x_backward_time"]     = max(res_set[k]["1684x_backward_dma_time"],res_set[k]["1684x_backward_ops_time"])
             res_set[k]["2260_backward_time"]      = max(res_set[k]["2260_backward_dma_time"],res_set[k]["2260_backward_ops_time"])
             total_times["1684x_backward"]         += res_set[k]["1684x_backward_time"]
@@ -1061,28 +1170,83 @@ def calc_all_time(res_set):
             total_times["1684x_bwd_dma"]          += res_set[k]["1684x_backward_dma_time"]
             total_times["2260_bwd_dma"]           += res_set[k]["2260_backward_dma_time"]
             total_times["1684x_bwd_tiu"]          += res_set[k]["1684x_backward_ops_time"]
+            total_times["1684x_bwd_tiu_vec"]      += res_set[k]["1684x_backward_tiu_vec_time"]
+            total_times["1684x_bwd_tiu_cube"]     += res_set[k]["1684x_backward_tiu_cube_time"]
             total_times["2260_bwd_tiu"]           += res_set[k]["2260_backward_ops_time"]
-            total_times["backward_ops"]           += (res_set[k]["back_ops"] + res_set[k]["grad_chain_ops"] if "grad_chain_ops" in res_set[k] else res_set[k]["back_ops"])
-            total_times["total_ops"]              += (res_set[k]["back_ops"] + res_set[k]["grad_chain_ops"] if "grad_chain_ops" in res_set[k] else res_set[k]["back_ops"]) if "back_recompute" not in res_set[k] else res_set[k]["back_ops"] - res_set[k]["back_recompute"]
+            total_times["2260_bwd_tiu_vec"]       += res_set[k]["2260_backward_tiu_vec_time"]
+            total_times["2260_bwd_tiu_cube"]      += res_set[k]["2260_backward_tiu_cube_time"]
+            total_times["backward_ops"]           += res_set[k]["back_ops"]
+            total_times["total_ops"]              += res_set[k]["back_ops"] if "back_recompute" not in res_set[k] else res_set[k]["back_ops"] - res_set[k]["back_recompute"]
+            total_times["total_dma"]              += res_set[k]["back_dma"]
             if "1684x_backward" not in ops_total_times[name]:
                 ops_total_times[name]["1684x_backward"] = 0
                 ops_total_times[name]["2260_backward"]  = 0
                 ops_total_times[name]["1684x_bwd_dma"]  = 0
                 ops_total_times[name]["2260_bwd_dma"]   = 0
                 ops_total_times[name]["1684x_bwd_tiu"]  = 0
+                ops_total_times[name]["1684x_bwd_tiu_vec"] = 0
+                ops_total_times[name]["1684x_bwd_tiu_cube"]= 0
                 ops_total_times[name]["2260_bwd_tiu"]   = 0
+                ops_total_times[name]["2260_bwd_tiu_vec"] = 0
+                ops_total_times[name]["2260_bwd_tiu_cube"]= 0
                 ops_total_times[name]["backward_ops"]   = 0
                 ops_total_times[name]["backward_dma"]   = 0
                 ops_total_times[name]["bwd_count"]      = 0
-            ops_total_times[name]["1684x_backward"] += max(res_set[k]["1684x_backward_ops_time"], res_set[k]["1684x_backward_dma_time"])
-            ops_total_times[name]["2260_backward"]  += max(res_set[k]["2260_backward_ops_time"],  res_set[k]["2260_backward_dma_time"])
+                ops_total_times[name]["grad_add_1684x_backward_dma_time"] = 0
+                ops_total_times[name]["grad_add_2260_backward_dma_time"]  = 0
+                ops_total_times[name]["grad_add_1684x_backward_tiu_time"] = 0
+                ops_total_times[name]["grad_add_2260_backward_tiu_time"]  = 0
+                ops_total_times[name]["grad_add_count"] = 0
+                ops_total_times[name]["grad_add_ops"]   = 0
+                ops_total_times[name]["grad_add_dma"]   = 0
+                ops_total_times[name]["grad_add_1684x_backward"] = 0
+                ops_total_times[name]["grad_add_2260_backward"]  = 0
+            ops_total_times[name]["1684x_backward"]     += max(res_set[k]["1684x_backward_ops_time"], res_set[k]["1684x_backward_dma_time"])
+            ops_total_times[name]["2260_backward"]      += max(res_set[k]["2260_backward_ops_time"],  res_set[k]["2260_backward_dma_time"])
             ops_total_times[name]["1684x_bwd_dma"]      += res_set[k]["1684x_backward_dma_time"]
             ops_total_times[name]["2260_bwd_dma"]       += res_set[k]["2260_backward_dma_time"]
             ops_total_times[name]["1684x_bwd_tiu"]      += res_set[k]["1684x_backward_ops_time"]
+            ops_total_times[name]["1684x_bwd_tiu_vec"]  += res_set[k]["1684x_backward_tiu_vec_time"]
+            ops_total_times[name]["1684x_bwd_tiu_cube"] += res_set[k]["1684x_backward_tiu_cube_time"]
             ops_total_times[name]["2260_bwd_tiu"]       += res_set[k]["2260_backward_ops_time"]
+            ops_total_times[name]["2260_bwd_tiu_vec"]   += res_set[k]["2260_backward_tiu_vec_time"]
+            ops_total_times[name]["2260_bwd_tiu_cube"]  += res_set[k]["2260_backward_tiu_cube_time"]
             ops_total_times[name]["backward_ops"]       += res_set[k]["back_ops"]
             ops_total_times[name]["backward_dma"]       += res_set[k]["back_dma"]
             ops_total_times[name]["bwd_count"]          += 1
+            if "grad_chain_count" in res_set[k]:
+                if "grad_add_1684x_backward_dma_time" not in res_set[k]:
+                    res_set[k]["grad_add_1684x_backward_dma_time"] = 0
+                    res_set[k]["grad_add_2260_backward_dma_time"]  = 0
+                    res_set[k]["grad_add_1684x_backward_ops_time"] = 0
+                    res_set[k]["grad_add_2260_backward_ops_time"]  = 0
+                res_set[k]["grad_add_1684x_backward_dma_time"]            += res_set[k]["grad_chain_dma"] / params["1684x dma"]
+                res_set[k]["grad_add_2260_backward_dma_time"]             += res_set[k]["grad_chain_dma"] / params["2260 dma"]
+                handle_grad_add_time_calc(res_set, k)
+                # res_set[k]["grad_add_1684x_backward_ops_time"]            += res_set[k]["grad_chain_ops"] / (params["1684x f16 tiu"] if res_set[k]["input_dtype"][0] == "float16" else params["1684x f32 tiu"])
+                # res_set[k]["grad_add_2260_backward_ops_time"]             += res_set[k]["grad_chain_ops"] / (params["2260 f16 tiu"]  if res_set[k]["input_dtype"][0] == "float16" else params["2260 f32 tiu"])
+                total_times["total_ops"]                                  += res_set[k]["grad_chain_ops"]
+                total_times["total_dma"]                                  += res_set[k]["grad_chain_dma"]
+                total_times["1684x_backward"]                             += max(res_set[k]["grad_add_1684x_backward_dma_time"], res_set[k]["grad_add_1684x_backward_ops_time"])
+                total_times["2260_backward"]                              += max(res_set[k]["grad_add_2260_backward_dma_time"], res_set[k]["grad_add_2260_backward_ops_time"])
+                total_times["1684x_bwd_dma"]                              += res_set[k]["grad_add_1684x_backward_dma_time"]
+                total_times["2260_bwd_dma"]                               += res_set[k]["grad_add_2260_backward_dma_time"]
+                total_times["1684x_bwd_tiu"]                              += res_set[k]["grad_add_1684x_backward_ops_time"]
+                total_times["1684x_bwd_tiu_vec"]                          += res_set[k]["grad_add_1684x_backward_tiu_vec_time"]
+                total_times["1684x_bwd_tiu_cube"]                         += res_set[k]["grad_add_1684x_backward_tiu_cube_time"]
+                total_times["2260_bwd_tiu"]                               += res_set[k]["grad_add_2260_backward_ops_time"]
+                total_times["2260_bwd_tiu_vec"]                           += res_set[k]["grad_add_2260_backward_tiu_vec_time"]
+                total_times["2260_bwd_tiu_cube"]                          += res_set[k]["grad_add_2260_backward_tiu_cube_time"]
+                ops_total_times[name]["grad_add_1684x_backward"]          += max(res_set[k]["grad_add_1684x_backward_dma_time"], res_set[k]["grad_add_1684x_backward_ops_time"])
+                ops_total_times[name]["grad_add_2260_backward"]           += max(res_set[k]["grad_add_2260_backward_dma_time"], res_set[k]["grad_add_2260_backward_ops_time"])
+                ops_total_times[name]["grad_add_dma"]                     += res_set[k]["grad_chain_dma"]
+                ops_total_times[name]["grad_add_ops"]                     += res_set[k]["grad_chain_ops"]
+                ops_total_times[name]["grad_add_count"]                   += res_set[k]["grad_chain_count"]
+                ops_total_times[name]["grad_add_1684x_backward_dma_time"] += res_set[k]["grad_add_1684x_backward_dma_time"]
+                ops_total_times[name]["grad_add_2260_backward_dma_time"]  += res_set[k]["grad_add_2260_backward_dma_time"]
+                ops_total_times[name]["grad_add_1684x_backward_tiu_time"] += res_set[k]["grad_add_1684x_backward_ops_time"]
+                ops_total_times[name]["grad_add_2260_backward_tiu_time"]  += res_set[k]["grad_add_2260_backward_ops_time"]
+
     return res_set, total_times, ops_total_times
 
 def write_to_sheet(ws, data, start_row, start_col):
@@ -1107,10 +1271,12 @@ params = {
     "1684x vector tiu": 4e6,
     "2260 f16 tiu": 128e6,
     "2260 f32 tiu": 16e6,
+    "2260 cuba tiu": 128e6,
+    "2260 vector tiu": 32e6,
 }
 
 batchs = [1]
-whr = [512,768,960,1024]
+whr = [512,768,960,1024,1280,1536,1792,2048]
 # 如何更好生成表格
 summary_table = defaultdict(dict)
 
@@ -1144,7 +1310,7 @@ for nb, nw in product(batchs, whr):
     res_set = forward_dma_ops_calc()
     res_set = prepare_bwd_node_outputs_calc(res_set)
     res_set = calc_bwd_bdc_dma(res_set)
-    # res_set = calc_bwd_grad_chain(res_set)
+    res_set = calc_bwd_grad_chain(res_set)
     # calc backward graph and memory usage(time)
     res_set, total_times, ops_times = calc_all_time(res_set)
     fwd_bwd_df = pd.DataFrame.from_dict(res_set, orient='index')
