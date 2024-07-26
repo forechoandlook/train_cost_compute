@@ -168,6 +168,30 @@ def baddbmm_dma_op(node):
     return node
 
 @warp_dma_op_shape_node(special_op=True)
+def fuse_lora_dma_op(node):
+    info = node["comment"]
+    node["info"] = info
+    input_shape  = node['input_shape']
+    output_shape = node['output_shape']
+    # kernel_shape=[320,320], rank=4, weight_dtype=float16, lora_dtype=float32, fuse
+    kernel_shape = [int(info.split(",")[0].split("[")[1]), int(info.split(",")[1].split("]")[0])]
+    lora_rank    = int(info.split(",")[2].split("=")[1])
+    lora_up      = [kernel_shape[0], lora_rank]
+    lora_down    = [lora_rank, kernel_shape[1]]
+    dtype_len    = dtype_map[node['input_dtype'][0]]
+    s2l_dma      = np.prod(input_shape[0]) * dtype_len + np.prod(kernel_shape) * dtype_len + np.prod(lora_up) * dtype_len * 2 + np.prod(lora_down) * dtype_len * 2
+    l2s_dma      = np.prod(output_shape[0]) * dtype_len
+    node["s2l_dma"] = s2l_dma
+    node["l2s_dma"] = l2s_dma
+    ops          = 0
+    ops          += np.prod(input_shape[0]) * kernel_shape[1]
+    ops          += np.prod(input_shape[0]) * lora_rank * 8
+    ops          += np.prod(lora_rank) * kernel_shape[1] * 8
+    ops          += np.prod(output_shape[0]) * 2
+    node["ops"]  = ops
+    return node
+
+@warp_dma_op_shape_node(special_op=True)
 def scaled_dot_attention_dma_op(node):
     # input 3 output 1
     input_len    = len(node['input_shape'])
@@ -292,7 +316,9 @@ def linear_dma_op(node):
     dtype_len = dtype_map[node["input_dtype"][0]]
     input_shape  = node['input_shape'][0]
     output_shape = node['output_shape'][0]
-    s2l_dma      = np.prod(input_shape) * dtype_len
+    in_features  = int(info.split(",")[0].split("=")[1])
+    out_features = int(info.split(",")[1].split("=")[1])
+    s2l_dma      = np.prod(input_shape) * dtype_len + in_features * out_features * dtype_len
     l2s_dma      = np.prod(output_shape) * dtype_len
     ops          = np.prod(input_shape) * output_shape[-1]
     if is_bias:
@@ -303,7 +329,7 @@ def linear_dma_op(node):
     node["ops"]     = ops
     return node
 
-@warp_dma_op_shape_node(layout=[[layout.n_hw_model, layout.n_model, ]], norm_op=True, op_rate=5)
+@warp_dma_op_shape_node(layout=[[layout.n_hw_model, layout.n_model ]], norm_op=True, op_rate=5)
 def layer_norm_dma_op(node):
     return basic_dma_op(node)
 
@@ -427,6 +453,10 @@ def conv2d_node( node ):
     output_shape = node[node_key]['output_shape']
     weight_shape = [output_shape[0][1], input_shape[0][1], kernel_size[0], kernel_size[1]]
     return [ handle_input_shape(input_shape[0]), weight_shape ]
+
+@warp_node()
+def fuse_lora_node(node):
+    return basic_node(node)
 
 @warp_node()
 def scaled_dot_attention_node(node):
@@ -677,6 +707,34 @@ def back_add_node(node):
     node["back_ops"] = back_ops
     return node
 
+@back_warp_node(output_num=1)
+def back_fuse_lora_node(node):
+    input_shape  = node['input_shape'][0]
+    output_shape = node['output_shape'][0]
+    back_grad_idx = node['back_grad_idx']
+    info         = node['info']
+    # kernel_shape=[320,320], rank=4, weight_dtype=float16, lora_dtype=float32, fuse
+    kernel_shape = [int(info.split(",")[0].split("[")[1]), int(info.split(",")[1].split("]")[0])]
+    lora_rank    = int(info.split(",")[2].split("=")[1])
+    lora_up      = [kernel_shape[0], lora_rank]
+    lora_down    = [lora_rank, kernel_shape[1]]
+    dtype_len    = dtype_map[node['input_dtype'][0]]
+    dma  = 0
+    dma += np.prod(input_shape[0]) * dtype_len * 2
+    dma += np.prod(kernel_shape) * dtype_len
+    dma += np.prod(lora_up) * dtype_len * 2 * 2   #consider f32
+    dma += np.prod(lora_down) * dtype_len * 2 * 2 #consider f32
+    node["back_dma"] = dma
+    ops = 0
+    # input : x
+    # y = x @ kernel + const * ( x @ lora_up @ lora_down )
+    ops += np.prod(input_shape) * kernel_shape[1] # add
+    ops += np.prod(input_shape) * (lora_rank + 1) * 8
+    ops += np.prod( [input_shape[0], input_shape[1], lora_rank ] ) * kernel_shape[1] * 8
+    ops += np.prod(input_shape)
+    node["back_ops"] = ops
+    return node
+
 @back_warp_node(output_num=3)
 def back_scaled_dot_attention_node(node):
     # c = scaled_dot_attention(q, k, v) = softmax(q @ k.T / sqrt(d_k)) @ v
@@ -700,9 +758,11 @@ def back_scaled_dot_attention_node(node):
     # compute qk first 
     temp = [q[0], q[1], k[2]]
     ops = 0
+    recompute_ops = 0
     ops += np.prod(q) * k[2]
     # then compute softmax
     ops += np.prod(temp) * 7
+    temp_ops = recompute_ops
     # then compute grad v
     ops += help_mul_ops_dma(temp, output_shape, True, False) * (2 in back_grad_idx)
     # then compute grad softmax
@@ -712,6 +772,7 @@ def back_scaled_dot_attention_node(node):
     # then compute grad k
     ops += help_mul_ops_dma(q, temp, True, False) * (1 in back_grad_idx)
     node["back_ops"] = ops
+    node["back_recompute"] = temp_ops
     return node
 
 @back_warp_node(special_fn=True, output_num=2)
@@ -763,7 +824,6 @@ def back_cat_node(node):
 def back_chunk_node(node):
     # c = torch.chunk(a, 2, dim=1)
     # grad_a = torch.cat([grad_c[0], grad_c[1]], dim=1)
-    
     input_shape = node['input_shape']
     output_shape = node['output_shape']
     back_ops = 0

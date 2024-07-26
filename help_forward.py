@@ -13,6 +13,7 @@ from copy import deepcopy
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 import sys 
+
 class mylog:
     @staticmethod
     def info(*args, **kwargs):
@@ -200,7 +201,7 @@ def handle_link(cur_id:int|str, replace_id=None):
         for father_id in father_ids:
             idx = links[father_id].index(cur_id)
             links[father_id][idx] = int(replace_id)
-        if str(replace_id) not in links:
+        if str(replace_id) not in links or not links[str(replace_id)]:
             links[str(replace_id)] = links[str(cur_id)]
         del links[str(cur_id)]
     else:
@@ -254,21 +255,23 @@ def build_fuse_lora_op(node_id_lists):
     to           = id_info[ str(node_id_lists[0]) ]
     linear1      = id_info[ str(node_id_lists[1]) ]
     linear2      = id_info[ str(node_id_lists[2]) ]
+    linear3      = id_info[ str(node_id_lists[-1]) ]
+    weights      = [linear3["input_shape"][0][2], linear3["output_shape"][0][2]]
+    lora_rank    = linear1["output_shape"][0][2]
     name         = "fuse_lora"
     depth        = linear1['depth']
-    input_shape  = [ linear1['input_shape'][0], linear2["input_shape"][0] ]
+    input_shape  = [ linear1['input_shape'][0] ]
     output_shape = linear2['output_shape']
-    input_dtype  = [ to["input_dtype"][0], linear1['input_dtype'][0] ]
+    input_dtype  = [ to["input_dtype"][0] ]
     output_dtype = [ to["input_dtype"][0] ]
-    comment      = "fuse to->linear->linear->to->mul op"
+    comment      = f"kernel_shape=[{weights[0]},{weights[1]}], rank={lora_rank}, weight_dtype=float16, lora_dtype=float32, fuse to->linear->linear->to->mul->(add<-linear) op"
     return build_a_fuse_op(name, depth, input_shape, output_shape, input_dtype, output_dtype, comment)
 
 def lora_linear_match_and_rewrite(graph, links, raw_pattern="to->linear->linear->to->mul->(add<-linear)"):
     res = search_pattern(graph, links, raw_pattern)
     if not res: return graph, links, False
     res = [int(i) for i in res]
-    print(res, [ id_name[str(i)] for i in res])
-    # import pdb;pdb.set_trace()
+    mylog.info(res, [ id_name[str(i)] for i in res])
     next_nodes = [[graph, None]]
     flag = False
     fuse_lora_op = None
@@ -279,16 +282,21 @@ def lora_linear_match_and_rewrite(graph, links, raw_pattern="to->linear->linear-
         parent_id = list(parent.keys())[0] if parent else None
         if int(key_id) == int(res[0]):
             flag         = True
-            fuse_lora_op = build_fuse_lora_op(res)
             idx          = parent[parent_id]['children'].index(node)
             parent[parent_id]['children'][idx] = fuse_lora_op
+            parent[parent_id]['need_train'] = True
             fuse_lora_op_id = list(fuse_lora_op.keys())[0]
             handle_link(key_id, fuse_lora_op_id)
             continue
-        # elif int(key_id) == int(res[-1]):
-        #     parent[parent_id]['children'].remove(node)
-        #     handle_link(key_id)
-        #     continue
+        elif int(key_id) == int(res[-1]):
+            fuse_lora_op = build_fuse_lora_op(res)
+            parent[parent_id]['children'].remove(node)
+            handle_link(key_id)
+            continue
+        elif int(key_id) == int(res[-2]):
+            parent[parent_id]['children'].remove(node)
+            handle_link(key_id, fuse_lora_op_id)
+            continue
         elif int(key_id) in res:
             parent[parent_id]['children'].remove(node)
             handle_link(key_id)
@@ -303,7 +311,7 @@ def remove_attention_redundancy_nodes(graph, links, pattern="reshape->permute->r
     res = search_pattern(graph, links, pattern)
     # import pdb;pdb.set_trace()
     if not res: return graph, links, False
-    print(res, [ id_name[str(i)] for i in res])
+    mylog.info(res, [ id_name[str(i)] for i in res])
     next_nodes = [[graph, None]]
     flag = False
     while next_nodes:
@@ -337,9 +345,9 @@ def remove_attention_redundancy_nodes3(graph, links, pattern="reshape->permute->
 fuse_pattern = [
     lora_linear_match_and_rewrite,
     # attention_match_and_rewrite
-    remove_attention_redundancy_nodes,
-    remove_attention_redundancy_nodes2,
-    remove_attention_redundancy_nodes3,
+    # remove_attention_redundancy_nodes,
+    # remove_attention_redundancy_nodes2,
+    # remove_attention_redundancy_nodes3,
 ]
 
 def do_fuse():
@@ -371,9 +379,25 @@ if is_fuse:
     do_fuse2()
 
 
-with open("graph.json", "w") as f:
-    json.dump(graph, f, indent=4)
-import pdb;pdb.set_trace()
+def remove_empty_module():
+    global graph
+    next_nodes = [[graph, None]]
+    while next_nodes:
+        node, parent = next_nodes.pop()
+        key_id = list(node.keys())[0]
+        parent_key = list(parent.keys())[0] if parent else None
+        if "children" not in node[key_id] or node[key_id]['children'] == None:
+            continue
+        if len(node[key_id]['children']) == 0:
+            parent[parent_key]['children'].remove(node)
+        for child in node[key_id]['children'][::-1]:
+            next_nodes.append([child, node])
+
+remove_empty_module()
+
+# with open("graph.json", "w") as f:
+#     json.dump(graph, f, indent=4)
+# import pdb;pdb.set_trace()
 
 
 def find_grad_nodes(graph):
@@ -421,7 +445,6 @@ def parse_grad_module_info(grad_module):
 
 grads, grad_mem, adam_mem = parse_grad_module_info(grad_module)
 
-import pdb;pdb.set_trace()
 mylog.info(">>>>> find all activation node")
 starts = [i for i in grad_node_ids]
 activation_nodes = set()
@@ -641,7 +664,7 @@ class layout:
         node[k]["output_shape"]= new_output_shape
         return node
 
-import pdb;pdb.set_trace()
+# import pdb;pdb.set_trace()
 # init: 输入的权重，梯度权重 adam 
 weights         = total_graph.get('weights', 2041.164e6 )
 grad_weights    = grad_mem
@@ -801,13 +824,15 @@ def forward_dma_ops_calc():
         if node[node_key]["name"] in fix_op:
             node[node_key] = fix_op[node[node_key]["name"]](node[node_key])
         # layout.match_layout(node[node_key])
-        node[node_key]           = ops_info[node[node_key]["name"]](node[node_key])
-        res_node["name"]         = node[node_key]["name"]
-        res_node['id']           = node_key
-        res_node['depth']        = node[node_key]['depth']
-        node[node_key]['info']   = pre[pre_key]["comment"][:200] if depth > 1 else ""
-        res_node['path']         = node[node_key]['path']
-        res_node["info"]         = pre[pre_key]["comment"][:200] if depth > 1 else ""
+        node[node_key]                 = ops_info[node[node_key]["name"]](node[node_key])
+        res_node["name"]               = node[node_key]["name"]
+        res_node['id']                 = node_key
+        res_node['depth']              = node[node_key]['depth']
+        node[node_key]['info']         = pre[pre_key]["comment"][:200] if depth > 1 else ""
+        res_node['path']               = node[node_key]['path']
+        res_node["info"]               = pre[pre_key]["comment"][:200] if depth > 1 else ""
+        if res_node["name"] == "fuse_lora":
+            res_node["info"] = node[node_key]["comment"]
         res_node['align_input_shape']  = node_fn[res_node['name']](node)
         res_node["input_shape"]        = node[node_key]['input_shape']
         res_node["output_shape"]       = node[node_key]["output_shape"]
@@ -829,8 +854,8 @@ def forward_dma_ops_calc():
         res_set[node_key] = res_node
         return res_node
     next_nodes = [[graph, None]]
-    need_mem = defaultdict(dict)
-    tables = []
+    # need_mem = defaultdict(dict)
+    # tables = []
     while next_nodes:
         cur_node, father_node = next_nodes.pop()
         k = list(cur_node.keys())[0]
@@ -871,8 +896,11 @@ def insert_back_grad_idx(node):
         elif name == "group_norm":
             # check affine
             node["back_grad_idx"] = list(range(3))
+        elif name == "fuse_lora":
+            node["back_grad_idx"] = list(range(3))
         else:
             print("error: not support leaf node")
+            import pdb;pdb.set_trace()
             exit(1)
     else:
         # 看输入是否是激活节点，如果是就算
@@ -885,7 +913,7 @@ def insert_back_grad_idx(node):
         if input_num == len(input_ids):
             node["back_grad_idx"] = list(range(input_num))
         else:
-            input_ids_shapes = [res_set[i]["output_shape"][0] for i in input_ids]# 万一是多输出咋整？（特例再说吧） TODO fix it
+            input_ids_shapes = [res_set[i]["output_shape"][0] for i in input_ids]
             res = []
             for i in range(input_num):
                 if node["input_shape"][i] in input_ids_shapes:
@@ -925,6 +953,43 @@ def calc_bwd_bdc_dma(res_set):
             cur_back_in_degress[v] -= 1
             if cur_back_in_degress[v] == 0:
                 backward_start.append(v)
+    return res_set
+
+def calc_bwd_grad_chain(res_set):
+    build_reverse_links(links)
+    backward_start = [ str(i) for i in loss_nodes]
+    print("backward start",backward_start)
+    grad_set = set(grad_node_ids)
+    cur_back_in_degress = deepcopy(in_degree)
+    grad_add_count = 0
+    while backward_start:
+        start = backward_start.pop(0)
+        if start in activation_nodes and start in res_set:
+            # calculate 
+            # backward_node_fn
+            node = res_set[start]
+            name = node["name"]
+            grad_in    = len([i for i in links[node['id']] if str(i) in activation_nodes])
+            output_len = len(node['output_shape'])
+            if grad_in > output_len:
+                if output_len > 1:
+                    print("error: not support")
+                    import pdb;pdb.set_trace()
+                # grad will add by auto grad chain
+                node["grad_chain_count"] = grad_in - output_len
+                grad_add_count += grad_in - output_len
+                node["grad_chain_dma"]   = np.prod(node["output_shape"][0]) * dtype_map[node["output_dtype"][0]] * 3 * (grad_in - output_len)
+                node["grad_chain_ops"]   = np.prod(node["output_shape"][0]) * (grad_in - output_len)
+        if start in grad_set:
+            grad_set.remove(start)
+        if len(grad_set) == 0:
+            print("have found all the backward nodes")
+            break
+        for v in reverse_links[int(start)]:
+            cur_back_in_degress[v] -= 1
+            if cur_back_in_degress[v] == 0:
+                backward_start.append(v)
+    print("grad add count", grad_add_count)
     return res_set
 
 def calc_all_time(res_set):
@@ -985,10 +1050,10 @@ def calc_all_time(res_set):
         ops_total_times[name]["fwd_count"]     += 1
         # backward time
         if k in activation_nodes:
-            res_set[k]["1684x_backward_dma_time"] = res_set[k]["back_dma"] / params["1684x dma"]
-            res_set[k]["2260_backward_dma_time"]  = res_set[k]["back_dma"] / params["2260 dma"]
-            res_set[k]["1684x_backward_ops_time"] = res_set[k]["back_ops"] / (params["1684x f16 tiu"] if res_set[k]["input_dtype"][0] == "float16" else params["1684x f32 tiu"])
-            res_set[k]["2260_backward_ops_time"]  = res_set[k]["back_ops"] / (params["2260 f16 tiu"]  if res_set[k]["input_dtype"][0] == "float16" else params["2260 f32 tiu"])
+            res_set[k]["1684x_backward_dma_time"] = (res_set[k]["back_dma"] + res_set[k]["grad_chain_dma"] if "grad_chain_dma" in res_set[k] else res_set[k]["back_dma"]) / params["1684x dma"]
+            res_set[k]["2260_backward_dma_time"]  = (res_set[k]["back_dma"] + res_set[k]["grad_chain_dma"] if "grad_chain_dma" in res_set[k] else res_set[k]["back_dma"]) / params["2260 dma"]
+            res_set[k]["1684x_backward_ops_time"] = (res_set[k]["back_ops"] + res_set[k]["grad_chain_ops"] if "grad_chain_ops" in res_set[k] else res_set[k]["back_ops"]) / (params["1684x f16 tiu"] if res_set[k]["input_dtype"][0] == "float16" else params["1684x f32 tiu"])
+            res_set[k]["2260_backward_ops_time"]  = (res_set[k]["back_ops"] + res_set[k]["grad_chain_ops"] if "grad_chain_ops" in res_set[k] else res_set[k]["back_ops"]) / (params["2260 f16 tiu"]  if res_set[k]["input_dtype"][0] == "float16" else params["2260 f32 tiu"])
             res_set[k]["1684x_backward_time"]     = max(res_set[k]["1684x_backward_dma_time"],res_set[k]["1684x_backward_ops_time"])
             res_set[k]["2260_backward_time"]      = max(res_set[k]["2260_backward_dma_time"],res_set[k]["2260_backward_ops_time"])
             total_times["1684x_backward"]         += res_set[k]["1684x_backward_time"]
@@ -997,8 +1062,8 @@ def calc_all_time(res_set):
             total_times["2260_bwd_dma"]           += res_set[k]["2260_backward_dma_time"]
             total_times["1684x_bwd_tiu"]          += res_set[k]["1684x_backward_ops_time"]
             total_times["2260_bwd_tiu"]           += res_set[k]["2260_backward_ops_time"]
-            total_times["backward_ops"]           += res_set[k]["back_ops"]
-            total_times["total_ops"]              += res_set[k]["back_ops"]
+            total_times["backward_ops"]           += (res_set[k]["back_ops"] + res_set[k]["grad_chain_ops"] if "grad_chain_ops" in res_set[k] else res_set[k]["back_ops"])
+            total_times["total_ops"]              += (res_set[k]["back_ops"] + res_set[k]["grad_chain_ops"] if "grad_chain_ops" in res_set[k] else res_set[k]["back_ops"]) if "back_recompute" not in res_set[k] else res_set[k]["back_ops"] - res_set[k]["back_recompute"]
             if "1684x_backward" not in ops_total_times[name]:
                 ops_total_times[name]["1684x_backward"] = 0
                 ops_total_times[name]["2260_backward"]  = 0
@@ -1044,9 +1109,9 @@ params = {
     "2260 f32 tiu": 16e6,
 }
 
-batchs = range(1,2)
+batchs = [1]
 whr = [512,768,960,1024]
-
+# 如何更好生成表格
 summary_table = defaultdict(dict)
 
 for nb, nw in product(batchs, whr):
@@ -1079,6 +1144,7 @@ for nb, nw in product(batchs, whr):
     res_set = forward_dma_ops_calc()
     res_set = prepare_bwd_node_outputs_calc(res_set)
     res_set = calc_bwd_bdc_dma(res_set)
+    # res_set = calc_bwd_grad_chain(res_set)
     # calc backward graph and memory usage(time)
     res_set, total_times, ops_times = calc_all_time(res_set)
     fwd_bwd_df = pd.DataFrame.from_dict(res_set, orient='index')
